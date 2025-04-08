@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import sqlite3 from 'sqlite3';
+import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -23,7 +23,41 @@ app.use(express.json());
 
 // Database setup
 const dbPath = path.join(__dirname, 'pubmed.db');
-const db = new sqlite3.Database(dbPath);
+let db;
+
+try {
+  // Initialize database with better-sqlite3
+  db = new Database(dbPath, { verbose: console.log });
+  
+  // Create tables if they don't exist
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS searches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      search_id INTEGER,
+      pubmed_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      publication_date TEXT,
+      non_academic_authors TEXT,
+      company_affiliations TEXT,
+      corresponding_author_email TEXT,
+      FOREIGN KEY (search_id) REFERENCES searches(id)
+    )
+  `);
+  
+  console.log('Database initialized successfully');
+} catch (err) {
+  console.error('Error initializing database:', err);
+  // If database fails, we'll just use in-memory operations
+  console.log('Continuing without database persistence');
+}
 
 // Convert db methods to promises
 // Use a workaround for promisify with ESM modules
@@ -53,31 +87,6 @@ const dbGetAsync = (sql, params) => {
     });
   });
 };
-
-// Create tables if they don't exist
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS searches (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      query TEXT NOT NULL,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS results (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      search_id INTEGER,
-      pubmed_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      publication_date TEXT,
-      non_academic_authors TEXT,
-      company_affiliations TEXT,
-      corresponding_author_email TEXT,
-      FOREIGN KEY (search_id) REFERENCES searches(id)
-    )
-  `);
-});
 
 // Helper function to extract non-academic authors and their affiliations
 function extractAuthorsAndAffiliations(authors) {
@@ -481,32 +490,49 @@ app.post('/api/search', async (req, res) => {
       return res.status(400).json({ error: 'Search query is required' });
     }
 
-    // Log search query to database
-    const searchResult = await dbRunAsync(
-      'INSERT INTO searches (query) VALUES (?)',
-      [query]
-    );
-    
-    const searchId = searchResult.lastID;
+    let searchId = null;
+    // Store in database if available
+    if (db) {
+      try {
+        // Insert search query
+        const insertStmt = db.prepare('INSERT INTO searches (query) VALUES (?)');
+        const info = insertStmt.run(query);
+        searchId = info.lastInsertRowid;
+      } catch (dbErr) {
+        console.error('Database error when storing search:', dbErr);
+        // Continue even if database operations fail
+      }
+    }
     
     // Fetch data from PubMed API
     const data = await fetchPubMedData(query);
     
-    // Store results in database
-    if (data.results && data.results.length > 0) {
-      for (const result of data.results) {
-        await dbRunAsync(
-          'INSERT INTO results (search_id, pubmed_id, title, publication_date, non_academic_authors, company_affiliations, corresponding_author_email) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [
-            searchId,
-            result.pubmedId,
-            result.title,
-            result.publicationDate,
-            JSON.stringify(result.nonAcademicAuthors),
-            JSON.stringify(result.companyAffiliations),
-            result.correspondingAuthorEmail
-          ]
+    // Store results in database if available
+    if (db && searchId && data.results && data.results.length > 0) {
+      try {
+        const insertResultStmt = db.prepare(
+          'INSERT INTO results (search_id, pubmed_id, title, publication_date, non_academic_authors, company_affiliations, corresponding_author_email) VALUES (?, ?, ?, ?, ?, ?, ?)'
         );
+        
+        // Use a transaction for better performance
+        const transaction = db.transaction((results) => {
+          for (const result of results) {
+            insertResultStmt.run(
+              searchId,
+              result.pubmedId,
+              result.title,
+              result.publicationDate,
+              JSON.stringify(result.nonAcademicAuthors),
+              JSON.stringify(result.companyAffiliations),
+              result.correspondingAuthorEmail
+            );
+          }
+        });
+        
+        transaction(data.results);
+      } catch (dbErr) {
+        console.error('Database error when storing results:', dbErr);
+        // Continue even if database operations fail
       }
     }
 
@@ -520,7 +546,18 @@ app.post('/api/search', async (req, res) => {
 // API endpoint to get search history
 app.get('/api/history', async (req, res) => {
   try {
-    const searches = await dbAllAsync('SELECT * FROM searches ORDER BY timestamp DESC LIMIT 10');
+    let searches = [];
+    
+    if (db) {
+      try {
+        const stmt = db.prepare('SELECT * FROM searches ORDER BY timestamp DESC LIMIT 10');
+        searches = stmt.all();
+      } catch (dbErr) {
+        console.error('Database error when fetching history:', dbErr);
+        // Return empty array if database operations fail
+      }
+    }
+    
     res.json({ searches });
   } catch (error) {
     console.error('Error fetching search history:', error);
@@ -532,24 +569,40 @@ app.get('/api/history', async (req, res) => {
 app.get('/api/results/:searchId', async (req, res) => {
   try {
     const { searchId } = req.params;
+    let results = [];
     
-    const results = await dbAllAsync(
-      'SELECT * FROM results WHERE search_id = ?',
-      [searchId]
-    );
+    if (db) {
+      try {
+        const stmt = db.prepare('SELECT * FROM results WHERE search_id = ?');
+        results = stmt.all(searchId);
+        
+        // Convert stored JSON strings back to arrays
+        results = results.map(result => ({
+          ...result,
+          non_academic_authors: JSON.parse(result.non_academic_authors),
+          company_affiliations: JSON.parse(result.company_affiliations)
+        }));
+      } catch (dbErr) {
+        console.error('Database error when fetching results:', dbErr);
+        // Return empty array if database operations fail
+      }
+    }
     
-    // Convert stored JSON strings back to arrays
-    const formattedResults = results.map(result => ({
-      ...result,
-      non_academic_authors: JSON.parse(result.non_academic_authors),
-      company_affiliations: JSON.parse(result.company_affiliations)
-    }));
-    
-    res.json({ results: formattedResults });
+    res.json({ results });
   } catch (error) {
     console.error('Error fetching results:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// Add a health check endpoint for render.com
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'Service is running' });
+});
+
+// Handle root route
+app.get('/', (req, res) => {
+  res.json({ message: 'Welcome to PubMed Explorer API. Use /api/search to search for articles.' });
 });
 
 // Start the server
